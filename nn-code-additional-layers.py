@@ -6,6 +6,7 @@ import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.utils.data import DataLoader, random_split
 import time
 
 tic = time.process_time() 
@@ -60,6 +61,7 @@ transform = transforms.Compose([
 
 batch_size = 64
 
+
 trainset_augmented = torchvision.datasets.CIFAR10(root='./data', train=True,
                                         download=True, transform=transform_augmented)
 trainloader_augmented = torch.utils.data.DataLoader(trainset_augmented, batch_size=batch_size,
@@ -72,6 +74,17 @@ testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size,
 
 classes = ('plane', 'car', 'bird', 'cat',
            'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
+
+train_size = int(0.8 * len(trainset_augmented))  # 80% of the dataset for training
+val_size = len(trainset_augmented) - train_size  # Remaining 20% for validation
+train_dataset, val_dataset = random_split(trainset_augmented, [train_size, val_size])
+
+# Adjust the DataLoader for the training part
+trainloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=12)
+
+# Create a DataLoader for the validation part
+valloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=12)
+
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 print(device)
@@ -155,14 +168,13 @@ num_epochs=100
 
 best_val_accuracy = 0.0
 
-for epoch in range(num_epochs): 
+for epoch in range(num_epochs):
     net.train()
     running_loss = 0.0
     running_accuracy = 0.0
     
-    for inputs, labels in trainloader_augmented:
+    for inputs, labels in trainloader:
         inputs, labels = inputs.to(device), labels.to(device)
-
         optimizer.zero_grad()
         outputs = net(inputs)
         loss = criterion(outputs, labels)
@@ -172,25 +184,23 @@ for epoch in range(num_epochs):
         running_loss += loss.item()
         running_accuracy += calculate_accuracy(outputs, labels).item()
 
-    avg_train_loss = running_loss / len(trainloader_augmented)
-    avg_train_accuracy = running_accuracy / len(trainloader_augmented)
+    avg_train_loss = running_loss / len(trainloader)
+    avg_train_accuracy = running_accuracy / len(trainloader)
     
-    # Validation phase
     net.eval()
     val_loss = 0.0
     val_accuracy = 0.0
     with torch.no_grad():
-        for inputs, labels in testloader:
+        for inputs, labels in valloader:
             inputs, labels = inputs.to(device), labels.to(device)
             outputs = net(inputs)
             loss = criterion(outputs, labels)
             val_loss += loss.item()
             val_accuracy += calculate_accuracy(outputs, labels).item()
 
-    avg_val_loss = val_loss / len(testloader)
-    avg_val_accuracy = val_accuracy / len(testloader)
+    avg_val_loss = val_loss / len(valloader)
+    avg_val_accuracy = val_accuracy / len(valloader)
     
-    # Checkpointing
     if avg_val_accuracy > best_val_accuracy:
         best_val_accuracy = avg_val_accuracy
         torch.save(net.state_dict(), 'best_model.pth')
