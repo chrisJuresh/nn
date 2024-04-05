@@ -1,28 +1,23 @@
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader, Subset, random_split
 import torchvision
 import torchvision.transforms as transforms
 import matplotlib.pyplot as plt
 import numpy as np
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
 import time
 
 tic = time.process_time() 
 
+# Custom cutout augmentation
 class Cutout(object):
     def __init__(self, n_holes, length):
         self.n_holes = n_holes
         self.length = length
 
     def __call__(self, img):
-        """
-        Args:
-            img (Tensor): Tensor image of size (C, H, W).
-        Returns:
-            Tensor: Image with n_holes of dimension length x length cut out of it.
-        """
         h = img.size(1)
         w = img.size(2)
 
@@ -45,7 +40,7 @@ class Cutout(object):
 
         return img
 
-
+# Dataset augmentation transformation
 transform_augmented = transforms.Compose([
     transforms.RandomHorizontalFlip(),  
     transforms.RandomCrop(32, padding=4),
@@ -54,45 +49,31 @@ transform_augmented = transforms.Compose([
     transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
 ])
 
+# Unprocessed dataset transformation
 transform = transforms.Compose([
     transforms.ToTensor(),
-    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
 ])
 
+# Get datasets
+trainset_augmented = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_augmented)
+trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
+
+# Split datasets
+train_size = int(0.9 * len(trainset_augmented))
+val_size = len(trainset_augmented) - train_size
+indices = list(range(len(trainset_augmented)))
+train_indices, val_indices = indices[:train_size], indices[train_size:]
+val_dataset_non_augmented = Subset(trainset, val_indices)
+
+# Load datasets
 batch_size = 64
+trainloader = DataLoader(Subset(trainset_augmented, train_indices), batch_size=batch_size, shuffle=True, num_workers=12)
+valloader = DataLoader(val_dataset_non_augmented, batch_size=4, shuffle=False, num_workers=12)
 
-
-trainset_augmented = torchvision.datasets.CIFAR10(root='./data', train=True,
-                                        download=True, transform=transform_augmented)
-trainloader_augmented = torch.utils.data.DataLoader(trainset_augmented, batch_size=batch_size,
-                                          shuffle=True, num_workers=12)
-
-testset = torchvision.datasets.CIFAR10(root='./data', train=False,
-                                       download=True, transform=transform)
-testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size,
-                                         shuffle=False, num_workers=12)
-
-classes = ('plane', 'car', 'bird', 'cat',
-           'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
-
-train_size = int(0.8 * len(trainset_augmented))  # 80% of the dataset for training
-val_size = len(trainset_augmented) - train_size  # Remaining 20% for validation
-train_dataset, val_dataset = random_split(trainset_augmented, [train_size, val_size])
-
-# Adjust the DataLoader for the training part
-trainloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=12)
-
-# Create a DataLoader for the validation part
-valloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=12)
-
-
-device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-print(device)
-
-
-class DynamicConvBlock(nn.Module):
+# Model
+class Block(nn.Module):
     def __init__(self, in_channels, out_channels, num_convs, kernel_size=3):
-        super(DynamicConvBlock, self).__init__()
+        super(Block, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Linear(in_channels, num_convs)
         self.convs = nn.ModuleList([
@@ -105,13 +86,13 @@ class DynamicConvBlock(nn.Module):
         
     def forward(self, x):
         weight_vector = F.softmax(self.fc(self.avg_pool(x).squeeze()), dim=-1)
-        conv_outputs = torch.stack([conv(x) for conv in self.convs], dim=2)  # Shape: [N, C_out, num_convs, H, W]
+        conv_outputs = torch.stack([conv(x) for conv in self.convs], dim=2) 
         weighted_output = torch.sum(conv_outputs * weight_vector.unsqueeze(1).unsqueeze(-1).unsqueeze(-1), dim=2)
         return weighted_output
 
-class ClassifierBlock(nn.Module):
+class Classifier(nn.Module):
     def __init__(self, in_features, out_features):
-        super(ClassifierBlock, self).__init__()
+        super(Classifier, self).__init__()
         self.dense = nn.Linear(in_features, out_features)
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(0.5)
@@ -120,23 +101,24 @@ class ClassifierBlock(nn.Module):
         x = self.relu(self.dense(x))
         return self.dropout(x)
 
-class ModifiedCustomCNN(nn.Module):
+class CNN(nn.Module):
     def __init__(self, num_classes, num_blocks=[2, 2, 2], num_convs=3):
-        super(ModifiedCustomCNN, self).__init__()
+        super(CNN, self).__init__()
         in_channels = 3
         out_channels_sequence = [32, 64, 128]
         layers = []
         
         for i, num_block in enumerate(num_blocks):
             for j in range(num_block):
-                layers.append(DynamicConvBlock(in_channels, out_channels_sequence[i], num_convs))
+                layers.append(Block(in_channels, out_channels_sequence[i], num_convs))
                 in_channels = out_channels_sequence[i]
             layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
         
+        # Backbone
         self.features = nn.Sequential(*layers)
         self.flatten = nn.Flatten()
         self.classifier = nn.Sequential(
-            ClassifierBlock(128 * 4 * 4, 1024),  # Adjust the flattening size accordingly
+            Classifier(128 * 4 * 4, 1024), 
             nn.Dropout(0.2),
             nn.Linear(1024, num_classes)
         )
@@ -147,15 +129,16 @@ class ModifiedCustomCNN(nn.Module):
         x = self.classifier(x)
         return x
 
-# Initialize the model
+# Use GPU
+device = torch.device('cuda:0')
+
+# Initialize model
 num_classes = 20
-net = ModifiedCustomCNN(num_classes=num_classes).to(device)
+net = CNN(num_classes=num_classes).to(device)
 
-# CODE FROM https://pytorch.org/tutorials/beginner/blitz/cifar10_tutorial.html START
-
+# Define loss function and optimizer
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(net.parameters(), lr=0.001, weight_decay=1e-4)
-
 lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
 
 def calculate_accuracy(y_pred, y_true):
@@ -164,10 +147,11 @@ def calculate_accuracy(y_pred, y_true):
     accuracy = correct / y_true.shape[0]
     return accuracy
 
-num_epochs=100
-
+# Initialise training variables
+num_epochs=50
 best_val_accuracy = 0.0
 
+# Train the network
 for epoch in range(num_epochs):
     net.train()
     running_loss = 0.0
@@ -187,6 +171,7 @@ for epoch in range(num_epochs):
     avg_train_loss = running_loss / len(trainloader)
     avg_train_accuracy = running_accuracy / len(trainloader)
     
+    # Validation
     net.eval()
     val_loss = 0.0
     val_accuracy = 0.0
@@ -213,12 +198,18 @@ for epoch in range(num_epochs):
 
 print('Finished Training')
 
-# Test loop (make sure to replace 'testloader' with your DataLoader)
+# Test the network
+#### CODE FROM https://pytorch.org/tutorials/beginner/blitz/cifar10_tutorial.html START ####
+testset = torchvision.datasets.CIFAR10(root='./data', train=False,
+                                       download=True, transform=transform)
+testloader = torch.utils.data.DataLoader(testset, batch_size=4,
+                                         shuffle=False, num_workers=12)
+
 correct = 0
 total = 0
 with torch.no_grad():
     for data in testloader:
-        images, labels = data[0].to(device), data[1].to(device)  # Move data to the device
+        images, labels = data[0].to(device), data[1].to(device)
         outputs = net(images)
         _, predicted = torch.max(outputs.data, 1)
         total += labels.size(0)
@@ -226,11 +217,10 @@ with torch.no_grad():
 
 print(f'Accuracy of the network on the test images: {100 * correct // total} %')
 
-# Save the trained model
+# Save the model
 PATH = './cifar_net.pth'
 torch.save(net.state_dict(), PATH)
-
-# CODE FROM https://pytorch.org/tutorials/beginner/blitz/cifar10_tutorial.html END
+#### CODE FROM https://pytorch.org/tutorials/beginner/blitz/cifar10_tutorial.html END ####
 
 toc = time.process_time() 
-print(toc - tic)
+print('Time (s):', toc - tic)
