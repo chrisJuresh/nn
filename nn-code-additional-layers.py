@@ -6,7 +6,8 @@ import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, Subset, ConcatDataset
+from sklearn.model_selection import KFold
 import time
 
 tic = time.process_time() 
@@ -149,69 +150,94 @@ class ModifiedCustomCNN(nn.Module):
 
 # Initialize the model
 num_classes = 20
-net = ModifiedCustomCNN(num_classes=num_classes).to(device)
-
-# CODE FROM https://pytorch.org/tutorials/beginner/blitz/cifar10_tutorial.html START
-
+num_epochs = 100
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(net.parameters(), lr=0.001, weight_decay=1e-4)
+net = ModifiedCustomCNN(num_classes=num_classes).to(device)
+import copy
 
-lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
+# Assuming net is already defined and moved to the correct device
+k = 5
+kf = KFold(n_splits=k, shuffle=True, random_state=42)
 
+# For calculating accuracy
 def calculate_accuracy(y_pred, y_true):
-    _, predicted = torch.max(y_pred, 1)
-    correct = (predicted == y_true).float().sum()
-    accuracy = correct / y_true.shape[0]
-    return accuracy
-
-num_epochs=100
+    _, predicted = torch.max(y_pred.data, 1)
+    correct = (predicted == y_true).sum().item()
+    return correct / y_true.size(0)
 
 best_val_accuracy = 0.0
+best_model_wts = None
 
-for epoch in range(num_epochs):
-    net.train()
-    running_loss = 0.0
-    running_accuracy = 0.0
+for fold, (train_idx, val_idx) in enumerate(kf.split(trainset_augmented)):
+    print(f"Fold {fold+1}/{k}")
+    train_subsampler = Subset(trainset_augmented, train_idx)
+    val_subsampler = Subset(trainset_augmented, val_idx)
     
-    for inputs, labels in trainloader:
-        inputs, labels = inputs.to(device), labels.to(device)
-        optimizer.zero_grad()
-        outputs = net(inputs)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
-
-        running_loss += loss.item()
-        running_accuracy += calculate_accuracy(outputs, labels).item()
-
-    avg_train_loss = running_loss / len(trainloader)
-    avg_train_accuracy = running_accuracy / len(trainloader)
+    trainloader = DataLoader(train_subsampler, batch_size=batch_size, shuffle=True, num_workers=2)
+    valloader = DataLoader(val_subsampler, batch_size=batch_size, shuffle=False, num_workers=2)
     
-    net.eval()
-    val_loss = 0.0
-    val_accuracy = 0.0
-    with torch.no_grad():
-        for inputs, labels in valloader:
+    # Re-initialize the model and optimizer for each fold
+    net = ModifiedCustomCNN(num_classes=num_classes).to(device)
+    optimizer = optim.Adam(net.parameters(), lr=0.001, weight_decay=1e-4)
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
+    
+    for epoch in range(num_epochs):
+        net.train()
+        running_loss = 0.0
+        running_corrects = 0
+        
+        for inputs, labels in trainloader:
             inputs, labels = inputs.to(device), labels.to(device)
+            optimizer.zero_grad()
             outputs = net(inputs)
             loss = criterion(outputs, labels)
-            val_loss += loss.item()
-            val_accuracy += calculate_accuracy(outputs, labels).item()
+            loss.backward()
+            optimizer.step()
+            
+            _, preds = torch.max(outputs, 1)
+            running_loss += loss.item() * inputs.size(0)
+            running_corrects += torch.sum(preds == labels.data)
+        
+        # Move scheduler.step() here, after the inner loop
+        lr_scheduler.step()
+        
+        epoch_loss = running_loss / len(train_subsampler)
+        epoch_acc = running_corrects.double() / len(train_subsampler)
+        
+        # Validation phase
+        net.eval()
+        val_loss = 0.0
+        val_corrects = 0
+        
+        with torch.no_grad():
+            for inputs, labels in valloader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                
+                outputs = net(inputs)
+                loss = criterion(outputs, labels)
+                
+                _, preds = torch.max(outputs, 1)
+                val_loss += loss.item() * inputs.size(0)
+                val_corrects += torch.sum(preds == labels.data)
+        
+        val_loss = val_loss / len(val_subsampler)
+        val_acc = val_corrects.double() / len(val_subsampler)
+        
+        print(f'Fold {fold+1}, Epoch {epoch+1}/{num_epochs}, Train Loss: {epoch_loss:.4f}, Train Acc: {epoch_acc:.4f}, Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}')
+        
+        # Update best model if validation accuracy improves
+        if val_acc > best_val_accuracy:
+            best_val_accuracy = val_acc
+            best_model_wts = copy.deepcopy(net.state_dict())
 
-    avg_val_loss = val_loss / len(valloader)
-    avg_val_accuracy = val_accuracy / len(valloader)
-    
-    if avg_val_accuracy > best_val_accuracy:
-        best_val_accuracy = avg_val_accuracy
-        torch.save(net.state_dict(), 'best_model.pth')
+# After completing all folds
+print(f'Best Validation Accuracy: {best_val_accuracy}')
 
-    print(f'Epoch [{epoch + 1}/{num_epochs}], '
-          f'Train Loss: {avg_train_loss:.4f}, Train Accuracy: {avg_train_accuracy:.4f}, '
-          f'Val Loss: {avg_val_loss:.4f}, Val Accuracy: {avg_val_accuracy:.4f}')
-    
-    lr_scheduler.step()
+# Load the best model weights found during the cross-validation
+net.load_state_dict(best_model_wts)
 
-print('Finished Training')
+# Save the best model
+torch.save(net.state_dict(), 'best_model.pth')
 
 # Test loop (make sure to replace 'testloader' with your DataLoader)
 correct = 0
